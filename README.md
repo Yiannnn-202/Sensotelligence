@@ -1,2 +1,3 @@
 # Sensotelligence
-Achieve sensor-based intelligent systems. Coming soon~
+Achieve sensor-based intelligent systems.
+Coming soon~
