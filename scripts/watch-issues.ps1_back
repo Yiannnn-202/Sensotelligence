@@ -1,0 +1,803 @@
+#!/usr/bin/env pwsh
+<#
+.SYNOPSIS
+    本地 Daemon：监控 GitHub Issues，自动调用 Copilot CLI 修复，创建 PR。
+
+.DESCRIPTION
+    触发条件（满足其一）：
+      1. Issue 标题包含 "[adminportal]"
+      2. Issue 被贴上 "adminportal_copilot-fix" 标签
+
+    用法：
+      # 前台运行（调试）
+      pwsh ./scripts/watch-issues.ps1
+
+      # 后台运行（生产）
+      pwsh ./scripts/watch-issues.ps1 -Detach
+
+.PARAMETER Repo
+    GitHub repo，格式 owner/repo。默认读取 .daemon-config.json
+
+.PARAMETER IntervalSeconds
+    轮询间隔（秒），默认 60
+
+.PARAMETER Detach
+    以后台进程方式运行
+
+.PARAMETER LogFile
+    日志文件路径，默认 logs/daemon.log
+#>
+
+param(
+    [string]$Repo = "",
+    [int]$IntervalSeconds = 60,
+    [switch]$Detach,
+    [string]$LogFile = ""
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# ── 读取配置 ────────────────────────────────────────────────
+$scriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
+$projectDir = Split-Path -Parent $scriptDir
+$configFile = Join-Path $projectDir ".daemon-config.json"
+$stateFile  = Join-Path $projectDir ".daemon-state.json"
+
+if (Test-Path $configFile) {
+    $config = Get-Content $configFile | ConvertFrom-Json
+    if (-not $Repo)              { $Repo = $config.repo }
+    if ($IntervalSeconds -eq 60 -and $config.intervalSeconds) { $IntervalSeconds = $config.intervalSeconds }
+    if (-not $LogFile -and $config.logFile) { $LogFile = $config.logFile }
+}
+
+# model 从配置文件读取，默认 auto（让 Copilot 自动选最优模型）
+$CopilotModel = if ($config -and $config.copilotModel) { $config.copilotModel } else { "auto" }
+
+if (-not $Repo) {
+    Write-Error "请在 .daemon-config.json 中设置 repo，或用 -Repo 参数传入（格式：owner/repo）"
+    exit 1
+}
+
+if (-not $LogFile) {
+    $logsDir = Join-Path $projectDir "logs"
+    New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
+    $LogFile = Join-Path $logsDir "daemon.log"
+}
+
+# ── 确保 Node / pnpm / Copilot CLI 在 PATH 中 ────────────────
+$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
+
+# ── 后台模式 ─────────────────────────────────────────────────
+if ($Detach) {
+    $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`" -Repo `"$Repo`" -IntervalSeconds $IntervalSeconds -LogFile `"$LogFile`""
+    Start-Process pwsh -ArgumentList $argList -WindowStyle Hidden
+    Write-Host "✅ Daemon 已在后台启动。日志：$LogFile"
+    Write-Host "   停止命令：pwsh ./scripts/watch-issues.ps1 -Stop"
+    exit 0
+}
+
+# ── 确保终端和日志输出 UTF-8 ─────────────────────────────────
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+$OutputEncoding           = [System.Text.Encoding]::UTF8
+
+# ── 日志函数 ─────────────────────────────────────────────────
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$timestamp][$Level] $Message"
+    Write-Host $line
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::AppendAllText($LogFile, "$line`n", $utf8NoBom)
+}
+
+# ── Issue 类型配置（标签状态机）────────────────────────────────
+# 每种类型定义：触发标签、处理中标签、完成标签、标题前缀
+$IssueTypes = @(
+    @{
+        TitlePrefix  = "[adminportal]"
+        LabelFix     = "adminportal_copilot-fix"
+        LabelProgress= "adminportal_in-progress"
+        LabelClosed  = "adminportal_copilot_closed"
+        TypeName     = "AdminPortal"
+    },
+    @{
+        TitlePrefix  = "[DB_Issue]"
+        LabelFix     = "DB_Issue"
+        LabelProgress= "DB_inprogress"
+        LabelClosed  = "DB_Fixed"
+        TypeName     = "DB"
+    },
+    @{
+        TitlePrefix  = "[FrontEnd_Issue]"
+        LabelFix     = "FrontEnd_Issue"
+        LabelProgress= "FrontEnd_inprogress"
+        LabelClosed  = "FrontEnd_Fixed"
+        TypeName     = "FrontEnd"
+    },
+    @{
+        TitlePrefix  = "[Backend_Issue]"
+        LabelFix     = "Backend_Issue"
+        LabelProgress= "Backend_inprogress"
+        LabelClosed  = "Backend_Fixed"
+        TypeName     = "Backend"
+    }
+)
+
+# ── Label 切换辅助函数 ───────────────────────────────────────
+function Set-IssueLabel {
+    param([int]$IssueNumber, [string]$AddLabel, [string[]]$RemoveLabels = @())
+    foreach ($lbl in $RemoveLabels) {
+        gh issue edit $IssueNumber --repo $Repo --remove-label $lbl 2>&1 | Out-Null
+    }
+    gh issue edit $IssueNumber --repo $Repo --add-label $AddLabel 2>&1 | Out-Null
+}
+
+# ── Issue 评论（写临时文件避免 PowerShell 反引号转义乱码）────
+function Send-IssueComment {
+    param([int]$IssueNumber, [string]$Body)
+    $tmpFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($tmpFile, $Body, $utf8NoBom)
+        gh issue comment $IssueNumber --repo $Repo --body-file $tmpFile 2>&1 | Out-Null
+    } finally {
+        Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ══════════════════════════════════════════════════════════════
+# 多 Agent 流水线：Stage 1 — Plan Agent
+# 分析 Issue 需求，输出实现计划文件 plan-issue-N.md
+# ══════════════════════════════════════════════════════════════
+function Invoke-PlanAgent {
+    param(
+        [int]$IssueNumber,
+        [string]$IssueTitle,
+        [string]$IssueBody,
+        [string]$BackendPath,
+        [string]$FrontendPath,
+        [string]$LogsDir
+    )
+
+    Write-Log "[Plan Agent] 开始需求分析 Issue #${IssueNumber}..."
+    $planFile = Join-Path $LogsDir "plan-issue-${IssueNumber}.md"
+
+    $prompt = @"
+你是一个需求分析 Agent。请分析以下 GitHub Issue，输出一份详细的实现计划。
+
+Issue #${IssueNumber}: ${IssueTitle}
+Issue 详情:
+${IssueBody}
+
+项目信息:
+- 代码位于 $projectDir（pnpm + Turborepo 单仓）
+- 技术栈：Next.js 14 + TypeScript + Prisma + PostgreSQL + RabbitMQ + MinIO
+- 只读参考目录：$BackendPath（Backend API）、$FrontendPath（Frontend）
+
+你的任务：
+1. 理解需求，识别核心功能点
+2. 列出需要新增/修改的文件（仅限 $projectDir 下）
+3. 描述每个文件需要做什么改动
+4. 评估风险点和需要注意的边界情况
+5. 如需参考 Backend/Frontend 的接口或类型，先读取相关文件
+
+输出格式（必须严格遵守，写入文件 $planFile）：
+---
+# Plan: Issue #${IssueNumber}
+
+## 需求理解
+[用1-3句话概括需求]
+
+## 受影响的文件
+- `路径/文件.ts` — 改动说明
+
+## 实现步骤
+1. 步骤一
+2. 步骤二
+...
+
+## 风险与注意事项
+- 注意点一
+- 注意点二
+
+## 需求清晰度
+CLEAR  （或 UNCLEAR: 缺少XXX信息）
+---
+
+将上述内容写入文件: $planFile
+"@
+
+    $output = copilot -p $prompt `
+        --allow-all-tools `
+        --add-dir $projectDir `
+        --add-dir (Split-Path -Parent $projectDir) `
+        -s --model $CopilotModel 2>&1
+    $output | Out-File -FilePath (Join-Path $LogsDir "plan-agent-issue-${IssueNumber}.log") -Encoding UTF8
+
+    # 检查需求清晰度，若 UNCLEAR 则在 Issue 上提问
+    if (Test-Path $planFile) {
+        $planContent = Get-Content $planFile -Raw -Encoding UTF8
+        if ($planContent -match "UNCLEAR:\s*(.+)") {
+            $unclearReason = $Matches[1].Trim()
+            Write-Log "[Plan Agent] ⚠️ 需求不清晰：$unclearReason，在 Issue 上留言提问" "WARN"
+            Send-IssueComment -IssueNumber $IssueNumber -Body @"
+🤔 **需求分析中发现信息不足，需要补充：**
+
+$unclearReason
+
+请补充描述后 Reopen 此 Issue。
+"@
+            return $null
+        }
+        Write-Log "[Plan Agent] ✅ 计划生成完成：$planFile"
+        return $planContent
+    } else {
+        Write-Log "[Plan Agent] ⚠️ 未找到计划文件，使用 Copilot 输出作为计划" "WARN"
+        return ($output | Out-String)
+    }
+}
+
+# ══════════════════════════════════════════════════════════════
+# 多 Agent 流水线：Stage 2 — Coding Agent
+# 严格按照 plan.md 实现代码改动
+# ══════════════════════════════════════════════════════════════
+function Invoke-CodingAgent {
+    param(
+        [int]$IssueNumber,
+        [string]$IssueTitle,
+        [string]$PlanContent,
+        [string]$ReviewFeedback,
+        [string]$BackendPath,
+        [string]$FrontendPath,
+        [string]$LogsDir,
+        [int]$Iteration = 1
+    )
+
+    Write-Log "[Coding Agent] 开始实现代码（第 ${Iteration} 次迭代）..."
+    $codingLog = Join-Path $LogsDir "coding-agent-issue-${IssueNumber}-iter${Iteration}.log"
+
+    $reviewSection = if ($ReviewFeedback) {
+        @"
+
+## Review 反馈（必须修复以下问题）
+$ReviewFeedback
+"@
+    } else { "" }
+
+    $prompt = @"
+你是一个专业的 Coding Agent。请严格按照实现计划修改代码，不要做计划外的改动。
+
+## 实现计划
+$PlanContent
+$reviewSection
+
+## 约束条件
+- 工作目录：$projectDir（只能修改此目录下的文件）
+- 只读参考：$BackendPath 和 $FrontendPath（禁止修改，可读取）
+- 严格遵守 .github/copilot-instructions.md 和 AGENTS.md 中的规范
+- TypeScript 严格模式，不允许 any 类型
+- 每个新函数必须有 JSDoc 注释
+
+## 完成标准
+按计划完成所有代码修改后，执行以下命令并确保通过：
+1. pnpm typecheck
+2. pnpm lint --fix
+
+修复所有 typecheck 和 lint 错误后，提交代码：
+git add -A
+git commit -m "fix: ${IssueTitle} (closes #${IssueNumber}) - iter${Iteration}"
+
+注意：只提交代码改动，不要运行 build 或 test（由后续 QA Agent 负责）。
+"@
+
+    $output = copilot -p $prompt `
+        --allow-all-tools `
+        --add-dir $projectDir `
+        --add-dir (Split-Path -Parent $projectDir) `
+        -s --model $CopilotModel 2>&1
+    $output | Out-File -FilePath $codingLog -Encoding UTF8
+    Write-Log "[Coding Agent] ✅ 编码完成。日志：$codingLog"
+
+    # 兜底：若未提交则手动 commit
+    $untracked = git status --porcelain 2>&1
+    if ($untracked) {
+        Write-Log "[Coding Agent] 检测到未提交改动，执行兜底 commit..."
+        git add -A 2>&1 | Out-Null
+        git commit -m "fix: ${IssueTitle} (closes #${IssueNumber}) - iter${Iteration}" 2>&1 | Out-Null
+    }
+
+    # 返回 git diff 供 Review Agent 使用
+    return (git diff main..HEAD 2>&1 | Out-String)
+}
+
+# ══════════════════════════════════════════════════════════════
+# 多 Agent 流水线：Stage 3 — Review Agent
+# 审查代码改动，输出 PASS 或 NEED_FIX
+# ══════════════════════════════════════════════════════════════
+function Invoke-ReviewAgent {
+    param(
+        [int]$IssueNumber,
+        [string]$IssueTitle,
+        [string]$PlanContent,
+        [string]$DiffContent,
+        [string]$LogsDir,
+        [int]$Iteration = 1
+    )
+
+    Write-Log "[Review Agent] 开始代码审查（第 ${Iteration} 次）..."
+    $reviewFile = Join-Path $LogsDir "review-issue-${IssueNumber}-iter${Iteration}.md"
+
+    $prompt = @"
+你是一个严格的 Code Review Agent。请审查以下代码改动，只关注真正重要的问题。
+
+## 原始需求计划
+$PlanContent
+
+## 代码改动（git diff）
+$DiffContent
+
+## 审查重点（按优先级）
+1. **正确性**：逻辑是否正确，是否满足需求计划中的所有要求
+2. **类型安全**：TypeScript 类型是否严格，有无 any 类型
+3. **安全性**：有无 SQL 注入、XSS、未授权访问等安全问题
+4. **边界条件**：空值处理、异常处理是否完整
+5. **代码质量**：有无明显的重复代码、性能问题
+
+## 输出要求
+将审查结果写入文件：$reviewFile
+
+格式：
+---
+# Review: Issue #${IssueNumber} - Iter ${Iteration}
+
+## 审查结论
+PASS  （或 NEED_FIX）
+
+## 问题列表（仅 NEED_FIX 时填写）
+### 问题1: [问题标题]
+- 位置：`文件路径:行号`
+- 问题：[描述]
+- 修复建议：[具体怎么改]
+
+## 优点
+[简要描述做得好的地方]
+---
+
+重要：只在有真正的 bug 或安全问题时才输出 NEED_FIX，风格问题请忽略。
+"@
+
+    $output = copilot -p $prompt `
+        --allow-all-tools `
+        --add-dir $projectDir `
+        --add-dir (Split-Path -Parent $projectDir) `
+        -s --model $CopilotModel 2>&1
+    $output | Out-File -FilePath (Join-Path $LogsDir "review-agent-issue-${IssueNumber}-iter${Iteration}.log") -Encoding UTF8
+
+    if (Test-Path $reviewFile) {
+        $reviewContent = Get-Content $reviewFile -Raw -Encoding UTF8
+        $isPassed = $reviewContent -match "^##\s*审查结论\s*\n\s*PASS" -or $reviewContent -match "PASS"
+        $isNeedFix = $reviewContent -match "NEED_FIX"
+
+        if ($isNeedFix -and -not $isPassed) {
+            Write-Log "[Review Agent] ❌ 需要修复，返回问题列表" "WARN"
+            return @{ Passed = $false; Feedback = $reviewContent; File = $reviewFile }
+        }
+    }
+
+    Write-Log "[Review Agent] ✅ 审查通过"
+    return @{ Passed = $true; Feedback = ""; File = $reviewFile }
+}
+
+# ══════════════════════════════════════════════════════════════
+# 多 Agent 流水线：Stage 4 — QA Agent
+# 运行完整测试，提交最终 commit，创建 PR
+# ══════════════════════════════════════════════════════════════
+function Invoke-QAAgent {
+    param(
+        [int]$IssueNumber,
+        [string]$IssueTitle,
+        [string]$BranchName,
+        [string]$PlanContent,
+        [string]$ReviewSummary,
+        [string]$LogsDir
+    )
+
+    Write-Log "[QA Agent] 开始质量验证..."
+    $qaLog = Join-Path $LogsDir "qa-agent-issue-${IssueNumber}.log"
+
+    $prompt = @"
+你是一个 QA Agent。请对当前代码改动执行完整的质量验证。
+
+## 背景
+Issue #${IssueNumber}: ${IssueTitle}
+分支：$BranchName
+
+## 验证步骤（必须全部执行）
+1. pnpm typecheck          — TypeScript 类型检查
+2. pnpm lint               — ESLint 检查
+3. pnpm build              — 构建检查
+4. pnpm test               — 单元测试
+
+## 处理规则
+- 若 typecheck/lint 失败：修复错误后重新运行
+- 若 build 失败且是预先存在的问题（非本次改动引入）：在日志中注明，继续下一步
+- 若 test 失败：修复失败的测试用例
+
+## 完成后输出
+将验证结果写入：$qaLog
+
+格式：
+QA_RESULT: PASS 或 QA_RESULT: FAIL
+- typecheck: ✅/❌
+- lint: ✅/❌
+- build: ✅/❌ (如失败注明是否为预先存在问题)
+- test: ✅/❌
+"@
+
+    $output = copilot -p $prompt `
+        --allow-all-tools `
+        --add-dir $projectDir `
+        --add-dir (Split-Path -Parent $projectDir) `
+        -s --model $CopilotModel 2>&1
+    $output | Out-File -FilePath $qaLog -Encoding UTF8
+
+    # 解析 QA 结果
+    $qaContent = if (Test-Path $qaLog) { Get-Content $qaLog -Raw -Encoding UTF8 } else { $output | Out-String }
+    $qaFailed = $qaContent -match "QA_RESULT:\s*FAIL"
+
+    if ($qaFailed) {
+        Write-Log "[QA Agent] ❌ 质量验证失败，放弃创建 PR" "ERROR"
+        return @{ Passed = $false; Summary = $qaContent }
+    }
+
+    Write-Log "[QA Agent] ✅ 质量验证通过"
+    return @{ Passed = $true; Summary = $qaContent }
+}
+
+# ══════════════════════════════════════════════════════════════
+# Stage 5 — E2E Agent
+# 调用 run-e2e.ps1，结果通过 JSON 文件传回（避免脚本 return 值不稳定）
+# ══════════════════════════════════════════════════════════════
+function Invoke-E2EAgent {
+    param(
+        [int]$IssueNumber,
+        [string]$IssueTitle,
+        [string]$IssueBody,
+        [string]$LogsDir
+    )
+
+    Write-Log "[E2E Agent] 开始 Playwright E2E 测试..."
+    $e2eScript     = Join-Path $scriptDir "run-e2e.ps1"
+    $outputJson    = Join-Path $LogsDir "e2e-result-${IssueNumber}.json"
+
+    # 删除旧结果文件
+    Remove-Item $outputJson -Force -ErrorAction SilentlyContinue
+
+    if (-not (Test-Path $e2eScript)) {
+        Write-Log "[E2E Agent] ⚠️ run-e2e.ps1 不存在，跳过 E2E" "WARN"
+        return @{ Passed = $true; PassCount = 0; FailCount = 0; Skipped = $true; Summary = "" }
+    }
+
+    # 调用 run-e2e.ps1 —— 结果写入 $outputJson，不依赖 return 值
+    & pwsh -NoProfile -ExecutionPolicy Bypass -File $e2eScript `
+        -IssueNumber  $IssueNumber `
+        -IssueTitle   $IssueTitle `
+        -IssueBody    $IssueBody `
+        -ProjectDir   $projectDir `
+        -LogsDir      $LogsDir `
+        -CopilotModel $CopilotModel `
+        -OutputJsonFile $outputJson `
+        2>&1 | Out-Null
+
+    # 读取 JSON 结果
+    if (Test-Path $outputJson) {
+        try {
+            $r = Get-Content $outputJson -Raw | ConvertFrom-Json
+            return @{
+                Passed    = [bool]$r.passed
+                PassCount = [int]$r.passCount
+                FailCount = [int]$r.failCount
+                Skipped   = [bool]$r.skipped
+                Summary   = [string]$r.summary
+            }
+        } catch {
+            Write-Log "[E2E Agent] ⚠️ 解析结果 JSON 失败：$_" "WARN"
+        }
+    }
+
+    Write-Log "[E2E Agent] ⚠️ 未找到结果文件，视为跳过" "WARN"
+    return @{ Passed = $true; PassCount = 0; FailCount = 0; Skipped = $true; Summary = "" }
+}
+
+# ══════════════════════════════════════════════════════════════
+# 核心入口：多 Agent 流水线总调度
+# ══════════════════════════════════════════════════════════════
+function Invoke-FixIssue {
+    param(
+        [int]$IssueNumber,
+        [string]$IssueTitle,
+        [string]$IssueBody,
+        [hashtable]$IssueType   # { TypeName, LabelFix, LabelProgress, LabelClosed }
+    )
+
+    $lblFix      = $IssueType.LabelFix
+    $lblProgress = $IssueType.LabelProgress
+    $lblClosed   = $IssueType.LabelClosed
+    $typeName    = $IssueType.TypeName
+
+    Write-Log "════════════════════════════════════════════════"
+    Write-Log "🚦 [$typeName] 开始处理 Issue #${IssueNumber} - ${IssueTitle}"
+    Write-Log "   模型：$CopilotModel | 流水线：Plan → Code → Review → QA"
+    Write-Log "════════════════════════════════════════════════"
+
+    Push-Location $projectDir
+
+    $backendPath  = Join-Path (Split-Path -Parent $projectDir) "Backend"
+    $frontendPath = Join-Path (Split-Path -Parent $projectDir) "Frontend"
+    $logsDir      = Split-Path -Parent $LogFile
+
+    try {
+        # ── 立即切换标签：fix → in-progress（防止重复触发）──────
+        Set-IssueLabel -IssueNumber $IssueNumber `
+            -AddLabel $lblProgress `
+            -RemoveLabels @($lblFix, $lblClosed)
+        Write-Log "🏷️ 标签已切换：$lblFix → $lblProgress"
+
+        # ── 准备：同步代码 & 创建分支 ──────────────────────────
+        git checkout main 2>&1 | Out-Null
+        git pull origin main 2>&1 | Out-Null
+        $timestamp  = Get-Date -Format "yyyyMMddHHmmss"
+        $branchName = "fix/issue-$IssueNumber-$timestamp"
+        git checkout -b $branchName 2>&1 | Out-Null
+        Write-Log "创建分支：$branchName"
+
+        pnpm install --frozen-lockfile 2>&1 | Out-Null
+        pnpm db:generate 2>&1 | Out-Null
+
+        # ── Stage 1: Plan Agent ─────────────────────────────────
+        $planContent = Invoke-PlanAgent `
+            -IssueNumber $IssueNumber `
+            -IssueTitle  $IssueTitle `
+            -IssueBody   $IssueBody `
+            -BackendPath  $backendPath `
+            -FrontendPath $frontendPath `
+            -LogsDir      $logsDir
+
+        if ($null -eq $planContent) {
+            # 需求不清晰，已在 Issue 留言，放弃本次处理
+            Write-Log "⏸️ Issue #${IssueNumber} 需求不清晰，等待补充后重新处理" "WARN"
+            git checkout main 2>&1 | Out-Null
+            return
+        }
+
+        # ── Stage 2+3: Code → Review 循环（最多 2 次迭代）─────
+        $maxIterations = 2
+        $reviewFeedback = ""
+        $finalDiff = ""
+
+        for ($iter = 1; $iter -le $maxIterations; $iter++) {
+            Write-Log "── 迭代 ${iter}/${maxIterations} ──"
+
+            # Stage 2: Coding Agent
+            $diffContent = Invoke-CodingAgent `
+                -IssueNumber    $IssueNumber `
+                -IssueTitle     $IssueTitle `
+                -PlanContent    $planContent `
+                -ReviewFeedback $reviewFeedback `
+                -BackendPath    $backendPath `
+                -FrontendPath   $frontendPath `
+                -LogsDir        $logsDir `
+                -Iteration      $iter
+
+            # Stage 3: Review Agent
+            $reviewResult = Invoke-ReviewAgent `
+                -IssueNumber $IssueNumber `
+                -IssueTitle  $IssueTitle `
+                -PlanContent $planContent `
+                -DiffContent $diffContent `
+                -LogsDir     $logsDir `
+                -Iteration   $iter
+
+            if ($reviewResult.Passed) {
+                $finalDiff = $diffContent
+                Write-Log "✅ Review 通过，进入 QA 阶段"
+                break
+            } elseif ($iter -lt $maxIterations) {
+                $reviewFeedback = $reviewResult.Feedback
+                Write-Log "🔄 Review 未通过，进入第 $($iter+1) 次迭代修复..."
+            } else {
+                Write-Log "⚠️ 已达最大迭代次数，Review 仍有问题，继续推进 QA" "WARN"
+                $finalDiff = $diffContent
+            }
+        }
+
+        # ── 检查是否有代码改动 ──────────────────────────────────
+        $commitDiff = git log main..HEAD --oneline 2>&1
+        if (-not $commitDiff) {
+            Write-Log "⚠️ 分支与 main 无差异，Copilot 未做任何修改" "WARN"
+            Send-IssueComment -IssueNumber $IssueNumber -Body "⚠️ 多 Agent 流水线未检测到可修复的内容。请补充更多描述后 Reopen，并重新添加 ``$lblFix`` 标签。"
+            gh issue close $IssueNumber --repo $Repo --reason "completed" 2>&1 | Out-Null
+            Set-IssueLabel -IssueNumber $IssueNumber `
+                -AddLabel $lblClosed `
+                -RemoveLabels @($lblProgress, $lblFix)
+            git checkout main 2>&1 | Out-Null
+            return
+        }
+
+        # ── Stage 4: QA Agent ───────────────────────────────────
+        $qaResult = Invoke-QAAgent `
+            -IssueNumber   $IssueNumber `
+            -IssueTitle    $IssueTitle `
+            -BranchName    $branchName `
+            -PlanContent   $planContent `
+            -ReviewSummary $reviewResult.Feedback `
+            -LogsDir       $logsDir
+
+        if (-not $qaResult.Passed) {
+            Write-Log "❌ QA 验证失败，标签回退到 $lblFix 等待重试" "ERROR"
+            Send-IssueComment -IssueNumber $IssueNumber -Body @"
+❌ QA 验证失败，无法创建 PR。详情：
+
+$($qaResult.Summary)
+
+标签已重置为 ``$lblFix``，Daemon 将自动重试。
+"@
+            Set-IssueLabel -IssueNumber $IssueNumber `
+                -AddLabel $lblFix `
+                -RemoveLabels @($lblProgress)
+            git checkout main 2>&1 | Out-Null
+            return
+        }
+
+        # ── Stage 5: E2E Agent ──────────────────────────────────
+        $e2eResult = Invoke-E2EAgent `
+            -IssueNumber $IssueNumber `
+            -IssueTitle  $IssueTitle `
+            -IssueBody   $IssueBody `
+            -LogsDir     $logsDir
+
+        $e2eStatusLine = if ($e2eResult.Skipped) {
+            "- ⏭️ **E2E Agent**：已跳过"
+        } elseif ($e2eResult.Passed) {
+            "- ✅ **E2E Agent**：Playwright 测试通过（通过: $($e2eResult.PassCount)，失败: $($e2eResult.FailCount)）"
+        } else {
+            "- ⚠️ **E2E Agent**：$($e2eResult.FailCount) 个测试失败（已记录，不阻塞 PR）"
+        }
+
+        # ── 推送 & 创建 PR ──────────────────────────────────────
+        Write-Log "推送分支 $branchName..."
+        git push origin $branchName 2>&1 | Out-Null
+
+        # 构建 PR body（包含各阶段摘要）
+        $planSummary = if ($planContent.Length -gt 500) { $planContent.Substring(0,500) + "..." } else { $planContent }
+        $e2eSummarySection = if (-not $e2eResult.Skipped -and $e2eResult.Summary) {
+            "`n### E2E 测试报告`n$($e2eResult.Summary)"
+        } else { "" }
+        $prBody = @"
+Closes #$IssueNumber
+
+## 自动修复说明（[$typeName]）
+由本地 Copilot CLI 多 Agent 流水线自动完成。
+
+### 流水线执行结果
+- ✅ **Plan Agent**：需求分析完成
+- ✅ **Coding Agent**：代码实现完成
+- ✅ **Review Agent**：代码审查通过
+- ✅ **QA Agent**：typecheck / lint / build / test 通过
+$e2eStatusLine
+
+### 实现计划摘要
+$planSummary
+$e2eSummarySection
+
+*请评审代码后合并。*
+"@
+
+        Write-Log "创建 PR..."
+        $prBodyFile = [System.IO.Path]::GetTempFileName()
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($prBodyFile, $prBody, $utf8NoBom)
+        $prUrl = gh pr create `
+            --repo $Repo `
+            --title "[$typeName] fix: $IssueTitle (#$IssueNumber)" `
+            --body-file $prBodyFile `
+            --base main `
+            --head $branchName 2>&1
+        Remove-Item $prBodyFile -Force -ErrorAction SilentlyContinue
+        Write-Log "PR 已创建：$prUrl"
+
+        # 关闭 Issue 并留言，切换标签为 closed
+        Send-IssueComment -IssueNumber $IssueNumber -Body @"
+✅ **[$typeName] 多 Agent 流水线完成！**
+
+PR 已创建：$prUrl
+
+**执行摘要：**
+- Plan Agent → Coding Agent → Review Agent → QA Agent 全部通过
+$e2eStatusLine
+
+合并 PR 后代码正式生效。如需重新处理请 Reopen 并重新添加 ``$lblFix`` 标签。
+"@
+        gh issue close $IssueNumber --repo $Repo --reason "completed" 2>&1 | Out-Null
+        Set-IssueLabel -IssueNumber $IssueNumber `
+            -AddLabel $lblClosed `
+            -RemoveLabels @($lblProgress, $lblFix)
+        Write-Log "🏷️ 标签已切换：$lblProgress → $lblClosed"
+        Write-Log "✅ Issue #${IssueNumber} 处理完成（[$typeName] 多 Agent 流水线）"
+
+    } catch {
+        Write-Log "❌ Issue #$IssueNumber 处理失败：$_" "ERROR"
+        git checkout main 2>&1 | Out-Null
+        # 失败时标签回退到 fix，允许重新触发
+        Set-IssueLabel -IssueNumber $IssueNumber `
+            -AddLabel $lblFix `
+            -RemoveLabels @($lblProgress)
+        Write-Log "🏷️ 标签已回退：$lblProgress → $lblFix（可重新触发）"
+        Send-IssueComment -IssueNumber $IssueNumber -Body "❌ 多 Agent 流水线执行失败，标签已重置为 ``$lblFix``，Daemon 将自动重试。错误：$_"
+    } finally {
+        Pop-Location
+    }
+}
+
+# ── 主循环 ────────────────────────────────────────────────────
+$allTriggerLabels = $IssueTypes | ForEach-Object { $_.LabelFix }
+Write-Log "🚀 Daemon 启动 | Repo: $Repo | 轮询间隔: ${IntervalSeconds}s | 模型: $CopilotModel"
+Write-Log "🔄 流水线模式：Plan Agent → Coding Agent → Review Agent（最多2次迭代） → QA Agent → E2E Agent"
+Write-Log "🏷️ 支持的 Issue 类型："
+foreach ($t in $IssueTypes) {
+    Write-Log "   [$($t.TypeName)] 标题前缀: $($t.TitlePrefix) | $($t.LabelFix) → $($t.LabelProgress) → $($t.LabelClosed)"
+}
+Write-Log "按 Ctrl+C 停止"
+
+while ($true) {
+    try {
+        # 查询所有 open Issues
+        $issues = gh issue list `
+            --repo $Repo `
+            --state open `
+            --json number,title,body,labels `
+            --limit 50 | ConvertFrom-Json
+
+        foreach ($issue in $issues) {
+            $labelNames = $issue.labels | ForEach-Object { $_.name }
+
+            # 遍历所有 Issue 类型，找到匹配的
+            $matchedType = $null
+            foreach ($itype in $IssueTypes) {
+                $hasFix      = $labelNames -contains $itype.LabelFix
+                $hasProgress = $labelNames -contains $itype.LabelProgress
+                $hasClosed   = $labelNames -contains $itype.LabelClosed
+                $hasPrefix   = $issue.title -match [regex]::Escape($itype.TitlePrefix)
+
+                # 标题触发但无任何该类型标签 → 自动添加触发标签
+                if ($hasPrefix -and -not $hasFix -and -not $hasProgress -and -not $hasClosed) {
+                    Write-Log "🏷️ Issue #$($issue.number) 标题 '$($itype.TitlePrefix)' 触发，自动添加 $($itype.LabelFix) 标签"
+                    gh issue edit $issue.number --repo $Repo --add-label $itype.LabelFix 2>&1 | Out-Null
+                    $hasFix = $true
+                }
+
+                # 找到带触发标签的类型
+                if ($hasFix) {
+                    $matchedType = $itype
+                    break
+                }
+            }
+
+            if ($null -eq $matchedType) { continue }
+
+            Write-Log "🎯 [$($matchedType.TypeName)] 检测到待处理 Issue #$($issue.number)：$($issue.title)"
+            Invoke-FixIssue `
+                -IssueNumber $issue.number `
+                -IssueTitle  $issue.title `
+                -IssueBody   ($issue.body ?? "") `
+                -IssueType   $matchedType
+        }
+    } catch {
+        Write-Log "轮询出错：$_" "WARN"
+    }
+
+    Write-Log "等待 ${IntervalSeconds}s..." "DEBUG"
+    Start-Sleep -Seconds $IntervalSeconds
+}
