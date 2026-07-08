@@ -4,6 +4,7 @@ import CinematicBackdrop from '../components/CinematicBackdrop'
 import { GlassPanel, InfoRow, MetricTile, ModeTabs, SectionHeader, SourceBadge } from '../components/FunctionalUI'
 import PageBottomActions from '../components/PageBottomActions'
 import WaveformChart from '../components/WaveformChart'
+import { getBackendStatus, getSessionDetail, type BackendStatus, type SessionDetail } from '../api/backend'
 import { useWebSocket } from '../hooks/useWebSocket'
 
 type Role = 'user' | 'researcher'
@@ -67,6 +68,8 @@ export default function MonitorPage() {
   const [startedAt, setStartedAt] = useState<number | null>(null)
   const [now, setNow] = useState(Date.now())
   const [showAdvanced, setShowAdvanced] = useState(false)
+  const [backendStatus, setBackendStatus] = useState<BackendStatus | null>(null)
+  const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null)
 
   const [demoHr, setDemoHr] = useState(72)
   const [demoRr, setDemoRr] = useState(16)
@@ -78,6 +81,9 @@ export default function MonitorPage() {
     latestFrame,
     connected,
     streaming,
+    sessionId,
+    statusMessage,
+    lastError,
     groundTruth,
     startSession,
     stopSession,
@@ -96,6 +102,47 @@ export default function MonitorPage() {
     const id = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(id)
   }, [])
+
+  useEffect(() => {
+    let cancelled = false
+
+    const loadStatus = () => {
+      getBackendStatus()
+        .then(status => {
+          if (!cancelled) setBackendStatus(status)
+        })
+        .catch(() => {
+          if (!cancelled) setBackendStatus(null)
+        })
+    }
+
+    loadStatus()
+    const id = window.setInterval(loadStatus, 5000)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [streaming])
+
+  useEffect(() => {
+    if (!sessionId) {
+      setSessionDetail(null)
+      return
+    }
+
+    let cancelled = false
+    getSessionDetail(sessionId)
+      .then(detail => {
+        if (!cancelled) setSessionDetail(detail)
+      })
+      .catch(() => {
+        if (!cancelled) setSessionDetail(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [sessionId, statusMessage])
 
   const setMode = (next: Role) => {
     setSearchParams(next === 'researcher' ? { role: 'researcher' } : { role: 'user' })
@@ -125,6 +172,7 @@ export default function MonitorPage() {
   const frameCount = latestFrame?.payload.frame_id ?? signalHistory.length
   const elapsed = startedAt ? Math.max(0, Math.floor((now - startedAt) / 1000)) : 0
   const hasSessionData = signalHistory.length > 0
+  const backendReachable = backendStatus?.backend === 'running'
 
   const ppgWaveform = signalHistory.slice(-360).map((value, index) => {
     return value * 0.28 + Math.sin(index / 8) * 0.12 + Math.sin(index / 25) * 0.04
@@ -280,7 +328,9 @@ export default function MonitorPage() {
 
               <div className="user-session-status">
                 <InfoRow label="服务状态" value={connected ? '已连接' : '未连接'} />
+                <InfoRow label="API状态" value={backendReachable ? `运行中 · v${backendStatus?.version}` : '未连接'} />
                 <InfoRow label="检测状态" value={streaming ? '检测中' : '待开始'} />
+                <InfoRow label="会话编号" value={sessionId ?? '--'} />
                 <InfoRow label="建议" value="保持静息 / 自然呼吸 / 减少移动" />
               </div>
 
@@ -302,7 +352,7 @@ export default function MonitorPage() {
               </div>
 
               <p className="user-session-note">
-                当前页面仅用于健康状态观察和系统演示，不作为医疗诊断或治疗依据。
+                {lastError ? `后端提示：${lastError}` : '当前页面仅用于健康状态观察和系统演示，不作为医疗诊断或治疗依据。'}
               </p>
             </GlassPanel>
           </section>
@@ -401,8 +451,8 @@ export default function MonitorPage() {
             <MetricTile
               icon="signal"
               label="实时通信"
-              value={connected ? '已连接' : '未连接'}
-              note="通过 WebSocket /ws 接收检测事件。"
+              value={connected && backendReachable ? 'WS/API 已连接' : connected ? 'WS 已连接' : '未连接'}
+              note="通过 WebSocket /ws 接收检测事件，并通过 REST API 查询后端状态。"
               source="实时"
               tone="live"
             />
@@ -443,6 +493,7 @@ export default function MonitorPage() {
 
               <div className="info-grid">
                 <InfoRow label="当前帧编号" value={frameCount} />
+                <InfoRow label="会话编号" value={sessionId ?? '--'} />
                 <InfoRow label="时间戳" value={latestFrame?.timestamp ? new Date(latestFrame.timestamp * 1000).toLocaleTimeString() : '--'} />
                 <InfoRow label="帧延迟" value={streaming ? '48 ms' : '待机'} />
                 <InfoRow label="丢帧数" value="0" />
@@ -521,8 +572,11 @@ export default function MonitorPage() {
                   {JSON.stringify(
                     {
                       数据源: 'Simulator',
+                      会话编号: sessionId ?? '--',
                       帧编号: frameCount,
                       信号值: Number(signal.toFixed(4)),
+                      API状态: backendStatus?.backend ?? 'unreachable',
+                      后端帧数: sessionDetail?.frame_count ?? 0,
                       采集中: streaming,
                     },
                     null,

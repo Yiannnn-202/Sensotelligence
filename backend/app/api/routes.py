@@ -1,9 +1,10 @@
 """REST API 路由"""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.core.config import settings
 from app.models.schemas import (
+    SessionDetailResponse,
     SessionStartRequest,
     SessionStartResponse,
     SessionStopResponse,
@@ -20,6 +21,7 @@ async def get_status():
         version=settings.app_version,
         radar_connected=session_manager.current_session is not None,
         session_active=session_manager.is_active,
+        current_session_id=session_manager.current_session.session_id if session_manager.current_session else None,
     )
 
 
@@ -34,6 +36,7 @@ async def start_session(req: SessionStartRequest):
     return SessionStartResponse(
         session_id=session.session_id,
         adapter="simulator",
+        started_at=session.started_at,
     )
 
 
@@ -43,7 +46,17 @@ async def stop_session():
     if session:
         return SessionStopResponse(
             session_id=session.session_id,
-            duration_s=(session.stopped_at - session.started_at) if session.stopped_at and session.started_at else 0,
+            duration_s=session.duration_s,
             frame_count=session.frame_count,
+            started_at=session.started_at,
+            stopped_at=session.stopped_at,
         )
     return SessionStopResponse(session_id="", duration_s=0, frame_count=0)
+
+
+@router.get("/session/{session_id}", response_model=SessionDetailResponse)
+async def get_session(session_id: str):
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    return SessionDetailResponse(**session.to_detail())
