@@ -1,3 +1,5 @@
+import CardIcon from './CardIcon'
+
 interface Props {
   label: string
   value: number | null
@@ -15,23 +17,23 @@ export default function VitalCard({
   displayValue,
   detail,
   status = 'ok',
-  badge = 'model output',
+  badge = 'Live',
 }: Props) {
-  const shownValue = displayValue ?? (value != null ? value.toFixed(unit === 'mmHg' ? 0 : 1) : '--')
+  const shownValue = displayValue ?? (value != null ? value.toFixed(unit === '%' ? 0 : 1) : '--')
+  const icon = label.includes('心') ? 'heart' : label.includes('呼') ? 'breath' : 'signal'
 
   return (
-    <article className="card metric-card">
-      <div className="card-inner metric-card">
-        <div className="metric-topline">
-          <span className="metric-label">{label}</span>
-          <span className={`status-pill ${status}`}>{badge}</span>
-        </div>
-        <div className="metric-value">
-          {shownValue}
-          {unit && <span className="metric-unit"> {unit}</span>}
-        </div>
-        {detail && <div className="metric-detail">{detail}</div>}
+    <article className={`vital-card ${status}`}>
+      <CardIcon variant={icon} />
+      <div className="metric-topline">
+        <span>{label}</span>
+        <em>{badge}</em>
       </div>
+      <div className="metric-value">
+        {shownValue}
+        {unit && <small>{unit}</small>}
+      </div>
+      {detail && <p>{detail}</p>}
     </article>
   )
 }

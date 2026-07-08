@@ -1,16 +1,81 @@
-import SessionControl from '../components/SessionControl'
-import VitalCard from '../components/VitalCard'
+import { useEffect, useMemo, useState } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
+import CinematicBackdrop from '../components/CinematicBackdrop'
+import { GlassPanel, InfoRow, MetricTile, ModeTabs, SectionHeader, SourceBadge } from '../components/FunctionalUI'
+import PageBottomActions from '../components/PageBottomActions'
 import WaveformChart from '../components/WaveformChart'
 import { useWebSocket } from '../hooks/useWebSocket'
+
+type Role = 'user' | 'researcher'
+
+interface Profile {
+  gender: string
+  age: string
+  height: string
+  weight: string
+  restingHr: string
+  conditions: string[]
+  state: string
+  note: string
+}
+
+type PipelineTone = 'live' | 'mock' | 'planned'
+
+const defaultProfile: Profile = {
+  gender: '未选择',
+  age: '',
+  height: '',
+  weight: '',
+  restingHr: '',
+  conditions: ['无'],
+  state: '静息',
+  note: '',
+}
+
+const conditionOptions = ['高血压', '心律异常', '呼吸系统疾病', '无', '其他']
+const profileStorageKey = 'sensotelligence_profile'
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
 }
 
+function loadProfile(): Profile {
+  try {
+    const raw = localStorage.getItem(profileStorageKey)
+    return raw ? { ...defaultProfile, ...JSON.parse(raw) } : defaultProfile
+  } catch {
+    return defaultProfile
+  }
+}
+
+function getRoleFromParams(searchParams: URLSearchParams): Role {
+  const roleParam = searchParams.get('role') ?? searchParams.get('mode')
+  return roleParam === 'researcher' ? 'researcher' : 'user'
+}
+
+function formatDuration(seconds: number) {
+  const mins = Math.floor(seconds / 60).toString().padStart(2, '0')
+  const secs = Math.floor(seconds % 60).toString().padStart(2, '0')
+  return `${mins}:${secs}`
+}
+
 export default function MonitorPage() {
+  const [searchParams, setSearchParams] = useSearchParams()
+  const role = getRoleFromParams(searchParams)
+
+  const [profile, setProfile] = useState<Profile>(() => loadProfile())
+  const [startedAt, setStartedAt] = useState<number | null>(null)
+  const [now, setNow] = useState(Date.now())
+  const [showAdvanced, setShowAdvanced] = useState(false)
+
+  const [demoHr, setDemoHr] = useState(72)
+  const [demoRr, setDemoRr] = useState(16)
+  const [demoNoise, setDemoNoise] = useState(5)
+
   const {
     signal,
     signalHistory,
+    latestFrame,
     connected,
     streaming,
     groundTruth,
@@ -18,152 +83,482 @@ export default function MonitorPage() {
     stopSession,
   } = useWebSocket()
 
-  const heartRate = streaming && groundTruth ? groundTruth.hr_bpm + signal * 1.8 : null
-  const systolic = streaming ? Math.round(118 + signal * 5) : null
-  const diastolic = streaming ? Math.round(74 + signal * 3) : null
-  const confidence = streaming ? clamp(93 - Math.abs(signal) * 10, 78, 97) : 0
-  const signalQuality = connected ? (streaming ? clamp(91 - Math.abs(signal) * 15, 64, 96) : 74) : 0
+  useEffect(() => {
+    localStorage.setItem(profileStorageKey, JSON.stringify(profile))
+  }, [profile])
+
+  useEffect(() => {
+    if (streaming && startedAt == null) setStartedAt(Date.now())
+    if (!streaming) setStartedAt(null)
+  }, [startedAt, streaming])
+
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [])
+
+  const setMode = (next: Role) => {
+    setSearchParams(next === 'researcher' ? { role: 'researcher' } : { role: 'user' })
+    setShowAdvanced(false)
+  }
+
+  const handleUserSessionToggle = () => {
+    if (streaming) {
+      stopSession()
+    } else {
+      startSession()
+    }
+  }
+
+  const handleResearchSessionToggle = () => {
+    if (streaming) {
+      stopSession()
+    } else {
+      startSession(demoHr, demoRr, demoNoise)
+    }
+  }
+
+  const heartRate = streaming && groundTruth ? groundTruth.hr_bpm + signal * 1.4 : null
+  const breathRate = streaming && groundTruth ? groundTruth.rr_bpm : null
+  const stability = connected ? (streaming ? clamp(92 - Math.abs(signal) * 16, 62, 97) : 76) : 0
+  const confidence = streaming ? clamp(91 - Math.abs(signal) * 12, 70, 96) : 0
+  const frameCount = latestFrame?.payload.frame_id ?? signalHistory.length
+  const elapsed = startedAt ? Math.max(0, Math.floor((now - startedAt) / 1000)) : 0
+  const hasSessionData = signalHistory.length > 0
+
   const ppgWaveform = signalHistory.slice(-360).map((value, index) => {
-    return value * 0.35 + Math.sin(index / 7) * 0.16 + Math.sin(index / 21) * 0.05
+    return value * 0.28 + Math.sin(index / 8) * 0.12 + Math.sin(index / 25) * 0.04
   })
 
+  const bmi = useMemo(() => {
+    const h = Number(profile.height) / 100
+    const w = Number(profile.weight)
+    return h > 0 && w > 0 ? (w / (h * h)).toFixed(1) : '未填写'
+  }, [profile.height, profile.weight])
+
+  const toggleCondition = (condition: string) => {
+    setProfile(current => {
+      if (condition === '无') {
+        return { ...current, conditions: ['无'] }
+      }
+
+      const withoutNone = current.conditions.filter(item => item !== '无')
+      const next = withoutNone.includes(condition)
+        ? withoutNone.filter(item => item !== condition)
+        : [...withoutNone, condition]
+
+      return { ...current, conditions: next.length ? next : ['无'] }
+    })
+  }
+
+  const headerCopy =
+    role === 'researcher'
+      ? {
+          label: '科研模式',
+          title: '科研模式：链路监测',
+          description:
+            '面向研究人员展示实时通信、数据帧、模拟输入、波形预览与模型状态，用于系统联调、科研验证和答辩说明。',
+        }
+      : {
+          label: '个人模式',
+          title: '个人模式：健康检测',
+          description:
+            '请先确认个人基础信息，再保持自然坐姿和静息状态开始检测。页面默认展示可理解的体征状态，专业波形与数据来源可在高级信息中展开查看。',
+        }
+
+  const bottomAction =
+    role === 'researcher'
+      ? {
+          title: '查看技术链路',
+          description: '完成链路调试后，可以查看系统接入状态、数据来源和后续模型落地计划。',
+          actions: [{ label: '查看技术链路', to: '/professional', variant: 'primary' as const }],
+        }
+      : {
+          title: '查看本次健康报告',
+          description: '检测完成后，可以查看本次状态总结和健康建议。',
+          actions: [{ label: '查看健康报告', to: '/results', variant: 'primary' as const }],
+        }
+
   return (
-    <main className="page">
-      <header className="dashboard-header">
-        <div>
-          <span className="eyebrow">real-time monitoring center</span>
-          <h1 className="page-title">雷达生命体征监测舱</h1>
-          <p className="page-subtitle">
-            当前接入模拟雷达流。界面已按目标系统展示设备状态、模型推理、血压、心率、PPG 和健康分析区域。
-          </p>
-        </div>
-        <div className="status-line">
-          <span className={`status-pill ${connected ? 'online' : 'danger'}`}>WebSocket {connected ? 'online' : 'offline'}</span>
-          <span className={`status-pill ${streaming ? 'ok' : 'warn'}`}>{streaming ? 'streaming' : 'standby'}</span>
-        </div>
-      </header>
+    <main className="page detect-page cinematic-subpage functional-page">
+      <CinematicBackdrop />
 
-      <section className="grid cols-4">
-        <VitalCard
-          label="心率"
-          value={heartRate}
-          unit="bpm"
-          detail="深度学习模型目标输出；当前由模拟雷达 ground truth 驱动。"
-          badge={streaming ? 'live' : 'mock'}
-        />
-        <VitalCard
-          label="血压"
-          value={null}
-          displayValue={systolic && diastolic ? `${systolic}/${diastolic}` : '--'}
-          unit="mmHg"
-          detail="收缩压 / 舒张压，目标由雷达到 PPG/血压模型反演。"
-          badge={streaming ? 'estimated' : 'mock'}
-        />
-        <VitalCard
-          label="信号质量"
-          value={signalQuality}
-          unit="%"
-          detail={`${signalHistory.length} 个雷达帧进入前端缓存。`}
-          status={signalQuality > 80 ? 'ok' : signalQuality > 50 ? 'warn' : 'danger'}
-          badge="quality"
-        />
-        <VitalCard
-          label="模型置信度"
-          value={streaming ? confidence : null}
-          unit="%"
-          detail="推理服务接入后显示真实置信度和延迟。"
-          status={confidence > 85 ? 'ok' : 'warn'}
-          badge="confidence"
-        />
-      </section>
+      <SectionHeader
+        label={headerCopy.label}
+        title={headerCopy.title}
+        description={headerCopy.description}
+      />
 
-      <section className="dashboard-grid section">
-        <div className="monitor-main">
-          <article className="card chart-card">
-            <WaveformChart
-              data={signalHistory}
-              streaming={streaming}
-              title="radar phase stream"
-              emptyText="启动采集后，毫米波雷达相位信号会在这里实时滚动。"
-            />
-          </article>
+      <ModeTabs value={role} onChange={setMode} />
 
-          <article className="card chart-card small">
-            <WaveformChart
-              data={ppgWaveform}
-              streaming={streaming}
-              title="reconstructed ppg waveform"
-              color="#7aa7ff"
-              min={-0.6}
-              max={0.6}
-              emptyText="PPG 波形区域已预留，真实模型接入后展示反演波形。"
-            />
-          </article>
-
-          <div className="grid cols-2">
-            <article className="card analysis-card">
-              <div className="card-inner analysis-card">
-                <span className="eyebrow">LLM health analysis</span>
-                <h2 className="analysis-title">短期健康解释</h2>
-                <p className="analysis-copy">
-                  {streaming
-                    ? '过去窗口内体征整体平稳，信号质量满足分析条件。建议继续静息采集以获得更稳定的血压和 PPG 趋势。'
-                    : '启动监测后，大模型会基于心率、血压、PPG 稳定性和信号质量生成短期健康摘要。'}
-                </p>
-              </div>
-            </article>
-            <article className="card analysis-card">
-              <div className="card-inner analysis-card">
-                <span className="eyebrow">alert engine</span>
-                <h2 className="analysis-title">异常监测</h2>
-                <ul className="list">
-                  <li>血压阈值与短时波动检测</li>
-                  <li>心率异常和运动伪影提示</li>
-                  <li>模型置信度过低时暂停健康建议</li>
-                </ul>
-              </div>
-            </article>
-          </div>
-        </div>
-
-        <aside className="side-stack">
-          <SessionControl
-            connected={connected}
-            streaming={streaming}
-            onStart={startSession}
-            onStop={stopSession}
-            groundTruth={groundTruth}
-          />
-
-          <article className="card">
-            <div className="card-inner pipeline">
-              <div className="control-header">
+      {role === 'user' ? (
+        <>
+          <section className="personal-detect-layout">
+            <GlassPanel className="profile-panel user-profile-panel" icon="report" badge="Local" badgeTone="mock">
+              <div className="panel-intro">
                 <div>
-                  <p className="control-title">实时链路</p>
-                  <p className="metric-detail">从硬件到智能分析的流式系统状态。</p>
+                  <h2>检测前信息</h2>
+                  <p>这些信息用于后续报告解释上下文，仅保存在浏览器本地，不作为诊断依据。</p>
                 </div>
               </div>
+
+              <div className="profile-grid refined-profile-grid">
+                <label>
+                  <span>性别</span>
+                  <select value={profile.gender} onChange={event => setProfile({ ...profile, gender: event.target.value })}>
+                    {['未选择', '男', '女', '其他'].map(item => <option key={item}>{item}</option>)}
+                  </select>
+                </label>
+
+                <label>
+                  <span>年龄</span>
+                  <input value={profile.age} onChange={event => setProfile({ ...profile, age: event.target.value })} placeholder="例如 24" />
+                </label>
+
+                <label>
+                  <span>身高 cm</span>
+                  <input value={profile.height} onChange={event => setProfile({ ...profile, height: event.target.value })} placeholder="例如 170" />
+                </label>
+
+                <label>
+                  <span>体重 kg</span>
+                  <input value={profile.weight} onChange={event => setProfile({ ...profile, weight: event.target.value })} placeholder="例如 60" />
+                </label>
+
+                <label>
+                  <span>静息心率范围</span>
+                  <input value={profile.restingHr} onChange={event => setProfile({ ...profile, restingHr: event.target.value })} placeholder="例如 60-80" />
+                </label>
+
+                <label>
+                  <span>当前状态</span>
+                  <select value={profile.state} onChange={event => setProfile({ ...profile, state: event.target.value })}>
+                    {['静息', '运动后', '紧张', '饭后', '睡前'].map(item => <option key={item}>{item}</option>)}
+                  </select>
+                </label>
+              </div>
+
+              <div className="chip-field refined-chip-field">
+                <span>基础疾病</span>
+                <div>
+                  {conditionOptions.map(item => (
+                    <button
+                      className={profile.conditions.includes(item) ? 'selected' : ''}
+                      type="button"
+                      key={item}
+                      onClick={() => toggleCondition(item)}
+                    >
+                      {item}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <label className="profile-note refined-profile-note">
+                <span>备注</span>
+                <textarea
+                  value={profile.note}
+                  onChange={event => setProfile({ ...profile, note: event.target.value })}
+                  placeholder="可填写近期睡眠、咖啡因摄入或不适感"
+                />
+              </label>
+
+              <div className="profile-summary refined-profile-summary">
+                <InfoRow label="BMI" value={bmi} />
+                <InfoRow label="状态" value={profile.state} />
+                <InfoRow label="基础疾病" value={profile.conditions.join(' / ')} />
+              </div>
+            </GlassPanel>
+
+            <GlassPanel className="user-session-panel" icon="play" badge={connected ? '已连接' : '未连接'} badgeTone={connected ? 'live' : 'mock'}>
+              <div className="panel-intro">
+                <div>
+                  <h2>准备开始检测</h2>
+                  <p>请保持安静坐姿，胸腹部自然呼吸。建议连续记录 60 秒，以获得更稳定的状态判断。</p>
+                </div>
+              </div>
+
+              <div className="user-session-status">
+                <InfoRow label="服务状态" value={connected ? '已连接' : '未连接'} />
+                <InfoRow label="检测状态" value={streaming ? '检测中' : '待开始'} />
+                <InfoRow label="建议" value="保持静息 / 自然呼吸 / 减少移动" />
+              </div>
+
+              <div className="user-session-actions">
+                <button
+                  className={`button ${streaming ? 'secondary' : 'primary'}`}
+                  type="button"
+                  onClick={handleUserSessionToggle}
+                  disabled={!connected}
+                >
+                  {streaming ? '停止检测' : '开始检测'}
+                </button>
+
+                {hasSessionData && !streaming ? (
+                  <Link className="button secondary user-session-report-link" to="/results">
+                    查看健康报告
+                  </Link>
+                ) : null}
+              </div>
+
+              <p className="user-session-note">
+                当前页面仅用于健康状态观察和系统演示，不作为医疗诊断或治疗依据。
+              </p>
+            </GlassPanel>
+          </section>
+
+          <section className="metric-grid four user-vitals-grid">
+            <MetricTile
+              icon="heart"
+              label="当前心率"
+              value={heartRate != null ? heartRate.toFixed(1) : '--'}
+              unit="bpm"
+              note="检测开始后显示实时估计值。"
+              source="实时"
+              tone="live"
+            />
+
+            <MetricTile
+              icon="breath"
+              label="当前呼吸"
+              value={breathRate ?? '--'}
+              unit="次/分"
+              note="检测开始后显示呼吸节律估计。"
+              source="实时"
+              tone="live"
+            />
+
+            <MetricTile
+              icon="signal"
+              label="检测稳定性"
+              value={stability.toFixed(0)}
+              unit="%"
+              note="用于判断当前检测过程是否平稳。"
+              source="估算"
+              tone="derived"
+            />
+
+            <MetricTile
+              icon="history"
+              label="检测时长"
+              value={formatDuration(elapsed)}
+              note="建议连续记录 60 秒。"
+              source="计时"
+              tone="derived"
+            />
+          </section>
+
+          <section className={`advanced-signal-section ${showAdvanced ? 'open' : ''}`}>
+            <GlassPanel className="advanced-signal-toggle" icon="signal"  badgeTone="mock">
+              <div className="advanced-toggle-copy">
+                <h2>高级信息</h2>
+                <p>这里展示波形预览和数据来源说明，普通用户无需理解全部细节。</p>
+              </div>
+
+              <button className="button secondary advanced-toggle-button" type="button" onClick={() => setShowAdvanced(value => !value)}>
+                {showAdvanced ? '收起高级信息' : '展开高级信息'}
+              </button>
+            </GlassPanel>
+
+            {showAdvanced ? (
+              <>
+                <section className="advanced-waveform-grid">
+                  <GlassPanel className="chart-card functional-chart" icon="signal" badge="演示" badgeTone="mock">
+                    <h2>检测过程波形</h2>
+                    <p>查看当前采集过程中的信号变化预览，用于理解检测稳定性。</p>
+                    <WaveformChart data={signalHistory} streaming={streaming} title="信号变化预览" />
+                  </GlassPanel>
+
+                  <GlassPanel className="chart-card functional-chart" icon="heart" badge="估算" badgeTone="derived">
+                    <h2>体征波形预览</h2>
+                    <p>当前为演示信号生成的体征波形预览，后续真实模型接入后可替换为正式输出。</p>
+                    <WaveformChart
+                      data={ppgWaveform}
+                      streaming={streaming}
+                      title="体征波形预览"
+                      color="#6f9dff"
+                      min={-0.6}
+                      max={0.6}
+                    />
+                  </GlassPanel>
+                </section>
+
+                <GlassPanel className="advanced-source-note" icon="database" badge="数据说明" badgeTone="mock">
+                  <h2>数据来源说明</h2>
+                  <div className="source-explain-grid">
+                    <InfoRow label="实时" value="来自当前检测会话" />
+                    <InfoRow label="估算" value="由前端根据信号变化计算" />
+                    <InfoRow label="演示" value="当前阶段部分数据用于页面验证" />
+                  </div>
+                </GlassPanel>
+              </>
+            ) : null}
+          </section>
+        </>
+      ) : (
+        <>
+          <section className="research-status-strip">
+            <MetricTile
+              icon="signal"
+              label="实时通信"
+              value={connected ? '已连接' : '未连接'}
+              note="通过 WebSocket /ws 接收检测事件。"
+              source="实时"
+              tone="live"
+            />
+
+            <MetricTile
+              icon="database"
+              label="数据模拟器"
+              value="运行中"
+              note="当前数据来自后端模拟器，用于验证页面链路。"
+              source="实时"
+              tone="live"
+            />
+
+            <MetricTile
+              icon="history"
+              label="数据帧率"
+              value={streaming ? '20' : '0'}
+              unit="FPS"
+              note="当前为演示链路估算值。"
+              source="模拟"
+              tone="mock"
+            />
+
+            <MetricTile
+              icon="model"
+              label="模型推理"
+              value={streaming ? '运行中' : '待接入'}
+              note="真实体征反演模型尚未接入。"
+              source="计划"
+              tone="planned"
+            />
+          </section>
+
+          <section className="research-layout">
+            <GlassPanel className="research-stream" icon="signal" badge="实时" badgeTone="live">
+              <h2>实时数据流</h2>
+              <p>展示当前检测会话中的数据帧、通信延迟、信号质量和模型置信度，便于判断链路是否稳定。</p>
+
+              <div className="info-grid">
+                <InfoRow label="当前帧编号" value={frameCount} />
+                <InfoRow label="时间戳" value={latestFrame?.timestamp ? new Date(latestFrame.timestamp * 1000).toLocaleTimeString() : '--'} />
+                <InfoRow label="帧延迟" value={streaming ? '48 ms' : '待机'} />
+                <InfoRow label="丢帧数" value="0" />
+                <InfoRow label="信号质量" value={`${stability.toFixed(0)}%`} />
+                <InfoRow label="模型置信度" value={streaming ? `${confidence.toFixed(0)}%` : '待机'} />
+              </div>
+
+              <WaveformChart data={signalHistory} streaming={streaming} title="距离 / 相位信号流" />
+            </GlassPanel>
+
+            <GlassPanel className="research-control research-control-clean" icon="play" badge={streaming ? '采集中' : '待机'} badgeTone={streaming ? 'live' : 'mock'}>
+              <div className="research-control-copy">
+                <h2>准备开始采集</h2>
+                <p>配置演示输入后开始采集，用于验证页面、实时链路和波形显示。</p>
+              </div>
+
+              <div className="research-slider-stack">
+                <label>
+                  <span>演示心率</span>
+                  <input
+                    type="range"
+                    min="45"
+                    max="120"
+                    value={demoHr}
+                    onChange={event => setDemoHr(Number(event.target.value))}
+                    disabled={streaming}
+                  />
+                  <em>{demoHr} bpm</em>
+                </label>
+
+                <label>
+                  <span>演示呼吸</span>
+                  <input
+                    type="range"
+                    min="8"
+                    max="28"
+                    value={demoRr}
+                    onChange={event => setDemoRr(Number(event.target.value))}
+                    disabled={streaming}
+                  />
+                  <em>{demoRr} 次/分</em>
+                </label>
+
+                <label>
+                  <span>环境干扰</span>
+                  <input
+                    type="range"
+                    min="0"
+                    max="30"
+                    value={demoNoise}
+                    onChange={event => setDemoNoise(Number(event.target.value))}
+                    disabled={streaming}
+                  />
+                  <em>{demoNoise}%</em>
+                </label>
+              </div>
+
+              <div className="research-control-actions">
+                <button
+                  className={`button ${streaming ? 'secondary' : 'primary'}`}
+                  type="button"
+                  onClick={handleResearchSessionToggle}
+                  disabled={!connected}
+                >
+                  {streaming ? '停止采集' : '开始采集'}
+                </button>
+
+                <Link className="button secondary" to="/results">
+                  查看检测结果
+                </Link>
+              </div>
+
+              <div className="raw-event">
+                <h3>原始事件预览</h3>
+                <code>
+                  {JSON.stringify(
+                    {
+                      数据源: 'Simulator',
+                      帧编号: frameCount,
+                      信号值: Number(signal.toFixed(4)),
+                      采集中: streaming,
+                    },
+                    null,
+                    2,
+                  )}
+                </code>
+              </div>
+            </GlassPanel>
+          </section>
+
+          <GlassPanel className="pipeline-panel" icon="model" badge="混合来源" badgeTone="planned">
+            <h2>模型链路</h2>
+
+            <div className="pipeline-flow">
               {[
-                ['01', '雷达输入', connected ? 'WebSocket connected' : 'Waiting for backend'],
-                ['02', '帧解析', `${signalHistory.length} frames cached`],
-                ['03', '模型推理', streaming ? 'mock inference running' : 'standby'],
-                ['04', '健康分析', streaming ? 'summary available' : 'waiting vitals'],
-              ].map(([index, name, desc]) => (
-                <div className="pipeline-step" key={index}>
-                  <span className="step-index">{index}</span>
-                  <span>
-                    <span className="step-name">{name}</span>
-                    <span className="step-desc">{desc}</span>
-                  </span>
-                  <span className={`status-pill ${streaming || index === '01' ? 'ok' : 'warn'}`}>
-                    {streaming || index === '01' ? 'active' : 'idle'}
-                  </span>
+                ['雷达帧解析', '计划', 'planned'],
+                ['信号预处理', '模拟', 'mock'],
+                ['体征推理模型', '计划', 'planned'],
+                ['实时事件推送', '实时', 'live'],
+                ['前端监测看板', '实时', 'live'],
+              ].map(([label, source, tone]) => (
+                <div className="pipeline-step" key={label}>
+                  <strong>{label}</strong>
+                  <SourceBadge tone={tone as PipelineTone}>{source}</SourceBadge>
                 </div>
               ))}
             </div>
-          </article>
-        </aside>
-      </section>
+          </GlassPanel>
+        </>
+      )}
+
+      <PageBottomActions
+        title={bottomAction.title}
+        description={bottomAction.description}
+        actions={bottomAction.actions}
+      />
     </main>
   )
 }
